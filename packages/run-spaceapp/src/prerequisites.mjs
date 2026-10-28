@@ -132,12 +132,17 @@ export async function ensureDockerAvailable({
   pathExists = fileExists,
   sleep = wait,
   osRelease,
+  offerPodman,
   installArgs,
   scheduleResume = scheduleWindowsInstallResume,
   confirmRestart = confirmWindowsRestart
 }) {
   if (await dockerIsReady(execute)) {
     return { code: 0, reexecuted: false };
+  }
+  if (typeof offerPodman === "function") {
+    const alternative = await offerPodman();
+    if (alternative) return alternative;
   }
   if (platform === "win32") {
     return ensureWindowsDocker({
