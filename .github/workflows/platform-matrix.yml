@@ -19,6 +19,76 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  podman:
+    name: Rootless Podman / small profile
+    # ubuntu-latest still has Podman 4.9; the GA 26.04 image ships Podman 5.7.
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    env:
+      SPACEAPP_HOME: ${{ runner.temp }}/spaceapp-podman
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22.23.0"
+      - name: Prepare rootless Podman and the supported Compose provider
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman uidmap dbus-user-session
+          mkdir -p "$RUNNER_TEMP/compose-bin"
+          cd "$RUNNER_TEMP/compose-bin"
+          url=https://github.com/docker/compose/releases/download/v2.39.4
+          curl --fail --location "$url/docker-compose-linux-x86_64" --output docker-compose
+          curl --fail --location "$url/docker-compose-linux-x86_64.sha256" --output checksum
+          expected=$(cut -d ' ' -f 1 checksum)
+          printf '%s  docker-compose\n' "$expected" | sha256sum --check
+          chmod +x docker-compose
+          echo "$RUNNER_TEMP/compose-bin" >> "$GITHUB_PATH"
+          uid=$(id -u)
+          sudo loginctl enable-linger "$USER"
+          sudo systemctl start "user@$uid.service"
+          export XDG_RUNTIME_DIR="/run/user/$uid"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+          echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" >> "$GITHUB_ENV"
+          systemctl --user enable --now podman.socket
+          podman info --format json
+      - name: Install, wait for readiness, and create a backup
+        shell: bash
+        run: |
+          node packages/run-spaceapp/bin/spaceapp.mjs install --engine podman --profile small \
+            --non-interactive --answers '{"confirm":true,"profile":"small","open":false}'
+          curl --fail --retry 30 --retry-delay 2 --retry-connrefused http://127.0.0.1:4911/readyz > "$RUNNER_TEMP/podman-readyz.json"
+          node --input-type=module -e 'import fs from "node:fs"; if (JSON.parse(fs.readFileSync(process.argv[1])).ok !== true) process.exit(1)' "$RUNNER_TEMP/podman-readyz.json"
+          node packages/run-spaceapp/bin/spaceapp.mjs doctor
+          node packages/run-spaceapp/bin/spaceapp.mjs backup --non-interactive --answers '{"confirm":true}'
+      - name: Purge the test installation and verify cleanup
+        if: always()
+        shell: bash
+        run: |
+          cleanup_status=0
+          if test -f "$SPACEAPP_HOME/config.json"; then
+            node packages/run-spaceapp/bin/spaceapp.mjs uninstall --purge-data \
+              --non-interactive --answers '{"confirm":true}' || cleanup_status=$?
+          fi
+          project=$(node --input-type=module -e 'import {composeProjectName} from "./packages/run-spaceapp/src/index.mjs"; console.log(composeProjectName(process.env.SPACEAPP_HOME))')
+          containers=$(podman ps -aq --filter "label=com.docker.compose.project=$project")
+          if test -n "$containers"; then
+            printf '%s\n' "$containers" | xargs podman rm --force
+            cleanup_status=1
+          fi
+          volumes=$(podman volume ls -q --filter "label=com.docker.compose.project=$project")
+          if test -n "$volumes"; then
+            printf '%s\n' "$volumes" | xargs podman volume rm --force
+            cleanup_status=1
+          fi
+          test -z "$(podman ps -aq --filter "label=com.docker.compose.project=$project")"
+          test -z "$(podman volume ls -q --filter "label=com.docker.compose.project=$project")"
+          exit "$cleanup_status"
+
   launcher:
     name: Launcher / ${{ matrix.os }} / Node ${{ matrix.node }}
     strategy:
