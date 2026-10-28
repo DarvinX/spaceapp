@@ -27,6 +27,87 @@ packaging requires its normal toolchain and separate platform acceptance.
 Dependency installation may use the network; the smoke command below does not
 need a provider account, API key, Docker, PostgreSQL or Temporal.
 
+## Run the full app from source
+
+After the dependency installation above, start the complete development stack:
+
+```sh
+npm run dev:stack
+```
+
+Docker Engine with Compose v2 must be running, and `sqlite3` must be on `PATH`
+for the application's SQLite-backed features. The command starts PostgreSQL
+with pgvector and Temporal in Docker, builds this checkout, applies migrations,
+then starts the API, Vite, Temporal worker and CLI host from this checkout.
+OpenCode is installed at the version pinned in `Dockerfile`, inside the
+checkout's state directory. No global provider installation or AI account is
+needed to open its terminal UI. Dependency images are read from the launcher's
+digest-pinned Compose template.
+
+Wait for the printed URL and one-time setup token. Open that URL, create the
+owner with the token, and sign in normally. The Getting Started room includes
+an OpenCode pane. This stack uses the normal owner setup and authentication;
+the development login shortcut is disabled. The browser service, companion
+services and root access are unavailable here. Provider calls still require
+an available model and, where applicable, provider credentials.
+
+The command stays in the foreground with service-labelled output. A service
+exit stops the stack and reports the failure. Stop it with Ctrl+C, or use
+another terminal in the same checkout:
+
+```sh
+npm run dev:stack -- down     # stop processes and containers, retain data
+npm run dev:stack -- reset    # also remove this checkout's volumes and state
+```
+
+Each checkout has its own Compose project and git-ignored `.dev-stack/`
+directory. Secrets are generated once per state directory with mode 0600;
+only the setup token is printed. The stack does not inherit operator API keys,
+SpaceApp settings, provider homes or Node preload hooks. The installed
+application's containers and volumes are outside its cleanup scope.
+
+Every exposed port binds to `127.0.0.1`:
+
+| Service | Default port | Override before first start |
+| --- | --- | --- |
+| Web | 5911 | `SPACE_DEV_WEB_PORT` |
+| API | 5910 | `SPACE_DEV_API_PORT` |
+| PostgreSQL | 55432 | `SPACE_DEV_POSTGRES_PORT` |
+| Temporal | 57233 | `SPACE_DEV_TEMPORAL_PORT` |
+| OpenCode server | 5799 | `SPACE_DEV_OPENCODE_PORT` |
+
+Ports are saved with the state. Run `reset` before changing them. Ports 4910
+and 4911 are reserved for installed SpaceApp and are refused by this command.
+API source edits restart the API; web source edits use Vite hot reload. After
+editing an internal package or worker source, run the following in a second
+terminal; the service watchers pick up the rebuilt package and worker files:
+
+```sh
+npm run dev:stack -- rebuild
+```
+
+On macOS, use Docker Desktop or start Colima with enough memory for PostgreSQL,
+Temporal and the source processes. Select the corresponding Docker context
+before starting. On Windows 11, clone and run inside WSL2, enable Docker
+Desktop's integration for that distribution, and keep the checkout on the
+Linux filesystem. Native Windows execution is refused because the CLI host
+uses Unix sockets and PTYs.
+
+If startup fails, inspect the named service output. Ensure Docker is running,
+the selected ports are free, and `npm ci` completed with the supported Node
+version. A fresh owner token expires after 15 minutes; restart the stack to
+renew its bootstrap window. Use a shorter checkout path if Unix socket paths
+exceed the platform limit. `down` preserves the database and generated secrets;
+use `reset` only when that development data can be discarded.
+Lifecycle operations are serialized. If an operation was forcibly killed and
+left `.dev-stack-operation.lock/`, first verify that no `dev:stack` operation
+is still running, then remove that guard directory and retry.
+
+Run the lifecycle regressions with `npm run test:dev-stack`. On an isolated
+Linux checkout, `node scripts/dev-stack/smoke.mjs` starts the real stack, claims
+the owner, signs in again, starts an OpenCode pane, and verifies cleanup. The
+source-stack CI job runs this smoke without a TTY.
+
 ## First executed task, without a provider
 
 ```sh
