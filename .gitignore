@@ -52,3 +52,7 @@ projects/
 .local/
 
 run-spaceapp-*.tgz
+
+# Disposable source development stack state and credentials.
+/.dev-stack/
+/.dev-stack-operation.lock/
