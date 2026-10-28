@@ -1,12 +1,64 @@
 # run-spaceapp
 
-Cross-platform Docker launcher for SpaceApp.
+Cross-platform container launcher for SpaceApp.
 
 Run the same command in Linux, macOS, or Windows 11 Command Prompt:
 
 ```bash
 npx --yes run-spaceapp@latest install
 ```
+
+### Rootless Podman on Linux and macOS
+
+Docker remains the default. To use an existing rootless Podman installation:
+
+```bash
+npx --yes run-spaceapp@latest install --engine podman --profile small
+```
+
+This requires **Podman >= 5**, **cgroup v2** with the CPU and memory controllers
+delegated to your user, and the **docker-compose v2 >= 2.24.4** executable on
+`PATH`. Every Compose command runs through `podman compose` with
+`PODMAN_COMPOSE_PROVIDER=docker-compose`. The Python `podman-compose` provider
+is not supported: this stack needs Compose profiles, optional health
+dependencies, file secrets, resource limits, shared socket volumes and `--wait`.
+The launcher does not install Podman or change its host configuration.
+
+On macOS, initialize and start a rootless Podman machine before installing.
+The machine must satisfy the selected profile's CPU, RAM and free-disk
+requirements. `doctor` explains an insufficient allocation; stop the machine,
+use `podman machine set --cpus`, `--memory` or `--disk-size` with suitable
+values, and restart it. Windows Podman is outside the supported scope.
+
+If Docker is unavailable and Podman is present, interactive installation offers
+Podman. Approved unattended installation selects it automatically. An explicit
+choice can also be supplied as `"engine":"podman"` in `--answers`:
+
+```bash
+npx --yes run-spaceapp@latest install --non-interactive --answers \
+  '{"confirm":true,"engine":"podman","profile":"small","open":false}'
+```
+
+The choice is saved in `config.json`; subsequent commands, including updates,
+checkpoints, backups, restores and uninstall, use that engine. Existing configs
+without an engine field continue using Docker. Switching engines on an existing
+installation is refused because Docker and Podman have separate volume stores.
+Use a separate `SPACEAPP_HOME` for a fresh installation; there is no automated
+cross-engine migration. `--access host-root` is refused with Podman.
+
+Workspace binds use shared SELinux labels (`z`) because the API and CLI services
+mount the same directories. Rootless user-namespace mapping makes container UID
+10001 correspond to the launching host user, preserving host ownership without
+recursive `chown`. Read-only workspaces remain read-only. Mount only directories
+you intend to share and relabel. `doctor` and `support-bundle` report engine
+version, rootless status, cgroup version and delegated CPU/memory limits.
+
+The Podman CI smoke job exercises the `small` profile, readiness, backup and
+purge on `ubuntu-26.04` (Podman 5.7). This is pinned because `ubuntu-latest`
+still points to 24.04 with Podman 4.9, below the supported minimum; the runner
+inventory is [published by GitHub](https://github.com/actions/runner-images/blob/main/images/ubuntu/Ubuntu2604-Readme.md).
+Linux SELinux enforcement, all three profiles and macOS machine behavior
+also need platform acceptance before a release claims those combinations.
 
 To keep a global `spaceapp` command for later operations, install it
 separately:
