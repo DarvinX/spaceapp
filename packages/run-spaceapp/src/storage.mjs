@@ -2,6 +2,7 @@ import { Writable } from "node:stream";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { composeCommand, profileRuntimeSettings, PROFILE_REQUIREMENTS } from "./index.mjs";
+import { containerEngine, engineCommand, inspectContainerEngine } from "./container-engine.mjs";
 import { localImageRefs } from "./image-lock.mjs";
 
 const GiB = 1024 ** 3;
@@ -96,15 +97,15 @@ async function installedImageDigests(root, version) {
 }
 
 export async function inspectStoragePlan({ root, config, existingConfig, resources, execute, operation, fetch = globalThis.fetch }) {
-  const dockerInfo = await captureProbe(execute, { command: "docker", args: ["info", "--format", "{{json .}}"] });
-  let engine = null;
-  try { engine = JSON.parse(dockerInfo); } catch { /* Conservative reserve when the engine is unavailable. */ }
+  const selectedEngine = containerEngine(config.engine);
+  const run = (spec, io) => execute(engineCommand(spec, selectedEngine), io);
+  const engine = await inspectContainerEngine(run, selectedEngine);
   const cachedLayers = new Set();
   if (engine && existingConfig) {
     const existingDigests = await installedImageDigests(root, existingConfig.version);
     for (const type of ["core", "cli", "browser"]) {
       for (const ref of localImageRefs(type, existingConfig.version, existingDigests[type])) {
-        const output = await captureProbe(execute, { command: "docker", args: ["image", "inspect", "--format", "{{json .RootFS.Layers}}", ref] });
+        const output = await captureProbe(run, { command: "docker", args: ["image", "inspect", "--format", "{{json .RootFS.Layers}}", ref] });
         try { for (const layer of JSON.parse(output)) cachedLayers.add(layer); break; } catch {}
       }
     }
@@ -126,7 +127,7 @@ export async function inspectStoragePlan({ root, config, existingConfig, resourc
     const refs = ["core", "cli", "browser"].includes(type) ? localImageRefs(type, config.version) : [image];
     let cached = null;
     for (const ref of refs) {
-      cached = await captureProbe(execute, { command: "docker", args: ["image", "inspect", "--format", "{{.Id}}", ref] });
+      cached = await captureProbe(run, { command: "docker", args: ["image", "inspect", "--format", "{{.Id}}", ref] });
       if (/^sha256:[a-f0-9]{64}$/.test(cached ?? "")) break;
     }
     if (!/^sha256:[a-f0-9]{64}$/.test(cached ?? "")) {
@@ -134,7 +135,7 @@ export async function inspectStoragePlan({ root, config, existingConfig, resourc
       let reserve = imageReserve[type] ?? GiB;
       if (engine && existingConfig && cachedLayers.size && typeof fetch === "function") {
         try {
-          const metadata = await registryLayers(image, /arm|aarch64/.test(engine.Architecture ?? "") ? "arm64" : "amd64", fetch);
+          const metadata = await registryLayers(image, /arm|aarch64/.test(engine.architecture ?? "") ? "arm64" : "amd64", fetch);
           if (metadata) { reserve = estimateMissingLayers(metadata.layers, metadata.diffIds, cachedLayers); sharedLayersEstimated = true; }
         } catch { /* Offline/private registry: retain the full conservative reserve. */ }
       }
@@ -143,7 +144,7 @@ export async function inspectStoragePlan({ root, config, existingConfig, resourc
   }
   let databaseBytes = 0, databaseSizeKnown = true;
   if (operation === "upgrade") {
-    const size = await captureProbe(execute, composeCommand("databaseSize", root, existingConfig ?? config));
+    const size = await captureProbe(run, composeCommand("databaseSize", root, existingConfig ?? config));
     databaseSizeKnown = /^\d+$/.test(size ?? "");
     if (databaseSizeKnown) databaseBytes = Number(size);
   }
@@ -151,28 +152,33 @@ export async function inspectStoragePlan({ root, config, existingConfig, resourc
     configBytes: await configurationBytes(root), databaseSizeKnown });
   let dockerFreeDiskBytes = null;
   if (existingConfig) {
-    const free = await captureProbe(execute, composeCommand("storageFree", root, existingConfig));
+    const free = await captureProbe(run, composeCommand("storageFree", root, existingConfig));
     if (/^\d+$/.test(free ?? "")) dockerFreeDiskBytes = Number(free);
   }
-  // Linux can measure the Docker filesystem directly even on a fresh install.
-  if (engine?.DockerRootDir && process.platform === "linux") {
+  // Linux can measure the engine filesystem directly even on a fresh install.
+  if (engine?.storageRoot && process.platform === "linux") {
     const { inspectSystemResources } = await import("./index.mjs");
-    try { dockerFreeDiskBytes = (await inspectSystemResources(engine.DockerRootDir)).freeDiskBytes; } catch {}
+    try { dockerFreeDiskBytes = (await inspectSystemResources(engine.storageRoot)).freeDiskBytes; } catch {}
   }
-  return { ...plan, missingImages, sharedLayersEstimated, dockerFreeDiskBytes,
+  if (selectedEngine === "podman" && Number.isFinite(engine?.storageAllocatedBytes) && Number.isFinite(engine?.storageUsedBytes)) {
+    dockerFreeDiskBytes = engine.storageAllocatedBytes - engine.storageUsedBytes;
+  }
+  return { ...plan, missingImages, sharedLayersEstimated, dockerFreeDiskBytes, engineInfo: engine, engineName: selectedEngine,
     resources: { ...resources,
+      engineName: selectedEngine,
       freeDiskBytes: dockerFreeDiskBytes === null ? resources.freeDiskBytes : Math.min(resources.freeDiskBytes, dockerFreeDiskBytes),
-      engineCpuCount: engine?.NCPU,
-      engineMemoryBytes: engine?.MemTotal
+      engineCpuCount: engine?.cpuCount,
+      engineMemoryBytes: engine?.memoryBytes
     } };
 }
 
 export function storageChecks(plan, resources) {
+  const engineName = plan.engineName === "podman" ? "Podman" : "Docker";
   const checks = [{ name: "Free disk", ok: resources.freeDiskBytes >= plan.requiredDiskBytes,
     detail: `${gib(resources.freeDiskBytes)} GiB available; ${gib(plan.requiredDiskBytes)} GiB required additionally for ${plan.operation} (images ${gib(plan.missingImageBytes)}, checkpoint ${gib(plan.checkpointBytes)}, reserve 0.5)` }];
-  if (plan.dockerFreeDiskBytes !== null) checks.push({ name: "Docker storage", ok: plan.dockerFreeDiskBytes >= plan.requiredDiskBytes,
+  if (plan.dockerFreeDiskBytes !== null) checks.push({ name: `${engineName} storage`, ok: plan.dockerFreeDiskBytes >= plan.requiredDiskBytes,
     detail: `${gib(plan.dockerFreeDiskBytes)} GiB available; ${gib(plan.requiredDiskBytes)} GiB required additionally` });
-  else checks.push({ name: "Docker storage", ok: true, detail: "Separate engine disk capacity unavailable; host estimate used. Docker ENOSPC will stop the operation before cutover." });
+  else checks.push({ name: `${engineName} storage`, ok: true, detail: `Separate engine disk capacity unavailable; host estimate used. ${engineName} ENOSPC will stop the operation before cutover.` });
   return checks;
 }
 
