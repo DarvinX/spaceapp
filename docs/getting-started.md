@@ -5,6 +5,27 @@ in Docker. The host needs Node.js only for the small `spaceapp` launcher,
 and enough resources for the stack. The launcher installs and starts Docker
 automatically when it is missing.
 
+Linux and macOS can instead use an existing **rootless Podman >= 5** installation
+with the **docker-compose v2 >= 2.24.4** provider and cgroup v2 CPU/memory
+delegation:
+
+```bash
+npx --yes run-spaceapp@latest install --engine podman --profile small
+```
+
+On macOS, start a rootless Podman machine first. Its CPU, memory and free disk
+must satisfy the selected profile; `doctor` reports insufficient allocations
+and points to `podman machine set` for resizing. The launcher never installs
+Podman. Windows Podman and `--access host-root` with Podman are unsupported.
+
+Docker remains the default when it works. If only Podman is available,
+interactive installation offers it and approved `--non-interactive`
+installation selects it. `--answers` accepts `"engine":"podman"`. Once saved,
+the engine drives every later command. Changing an existing installation's
+engine is refused because its volumes belong to that engine. See the
+[launcher guide](../packages/run-spaceapp/README.md#rootless-podman-on-linux-and-macos)
+for provider requirements, SELinux workspace mounts and verification limits.
+
 ## Requirements
 
 Minimum (the `small` profile):
