@@ -1,0 +1,47 @@
+name: Source development stack
+
+on:
+  pull_request:
+    paths:
+      - "scripts/dev-stack.mjs"
+      - "scripts/dev-stack/**"
+      - "scripts/tests/dev-stack.test.mjs"
+      - "apps/**"
+      - "packages/**"
+      - "package*.json"
+      - "Dockerfile"
+      - ".github/workflows/dev-stack.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: source-stack-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  source-stack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - name: Install locked source dependencies
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+        run: npm ci
+      - name: Install the SQLite command used by the application
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq sqlite3
+      - name: Isolation and lifecycle regressions
+        run: npm run test:dev-stack
+      - name: Owner setup, OpenCode pane and complete cleanup
+        run: node scripts/dev-stack/smoke.mjs
+      - name: Clean up after an interrupted smoke
+        if: always()
+        run: npm run dev:stack -- reset
