@@ -20,6 +20,7 @@ import {
 import { UNIVERSAL_COMMAND } from "./package-info.mjs";
 import { imageVerificationOff, verifyLockedImages } from "./image-attestations.mjs";
 import { IMAGE_TARGETS, imageDigestEnv, PACKAGE_IMAGE_LOCK, parseRecordedDigests } from "./image-lock.mjs";
+import { containerEngine, engineCommand, podmanComposeOverrides } from "./container-engine.mjs";
 
 const CONFIG_SCHEMA_VERSION = 4;
 const CONTAINER_SECRET_MODE = 0o644;
@@ -127,6 +128,7 @@ const CONFIG_KEYS = new Set([
   "port",
   "telemetry",
   "profile",
+  "engine",
   "accessMode",
   "workspaces",
   "companionsEnabled",
@@ -284,6 +286,7 @@ export function installResourceChecks(resources, profile = "small", { requiredDi
   if (!requirements) throw new Error("Unknown installation profile.");
   const minFreeDisk = requiredDiskBytes ?? (operation === "fresh" ? requirements.freshDiskBytes : 512 * 1024 ** 2);
   const engineMemoryBytes = { small: 3, medium: 5, large: 7, light: 3, standard: 3 }[profile] * 1024 ** 3;
+  const engineName = resources.engineName === "podman" ? "Podman" : "Docker";
   return [
     {
       name: "CPU",
@@ -300,9 +303,9 @@ export function installResourceChecks(resources, profile = "small", { requiredDi
       ok: freeDiskBytes >= minFreeDisk,
       detail: `${formatGibibytes(freeDiskBytes)} GiB available; ${formatGibibytes(minFreeDisk)} GiB required${operation === "fresh" ? "" : " additionally for " + operation}`
     },
-    ...(resources.engineMemoryBytes > 0 ? [{ name: "Docker memory", ok: resources.engineMemoryBytes >= engineMemoryBytes,
+    ...(resources.engineMemoryBytes > 0 ? [{ name: `${engineName} memory`, ok: resources.engineMemoryBytes >= engineMemoryBytes,
       detail: `${formatGibibytes(resources.engineMemoryBytes)} GiB allocated; ${formatGibibytes(engineMemoryBytes)} GiB required for ${profile}` }] : []),
-    ...(resources.engineCpuCount > 0 ? [{ name: "Docker CPU", ok: resources.engineCpuCount >= 4,
+    ...(resources.engineCpuCount > 0 ? [{ name: `${engineName} CPU`, ok: resources.engineCpuCount >= 4,
       detail: `${resources.engineCpuCount} allocated; 4 required` }] : [])
   ];
 }
@@ -311,6 +314,7 @@ export function createDefaultConfig({
   version,
   profile = "light",
   accessMode = "isolated",
+  engine,
   companionsEnabled = false
 }) {
   assertVersion(version);
@@ -327,6 +331,7 @@ export function createDefaultConfig({
     telemetry: false,
     profile,
     accessMode: resolvedAccessMode,
+    ...(engine === undefined ? {} : { engine: containerEngine(engine) }),
     companionsEnabled,
     optionalModules: "none",
     workspaces: []
@@ -366,6 +371,9 @@ export function validateConfig(config) {
   }
   if (config.accessMode !== "isolated" && config.accessMode !== "host-root") {
     throw new Error("accessMode must be isolated or host-root.");
+  }
+  if (containerEngine(config.engine) === "podman" && config.accessMode === "host-root") {
+    throw new Error("Host-root access is not supported with Podman. Use --access isolated.");
   }
   if (typeof config.companionsEnabled !== "boolean") {
     throw new Error("companionsEnabled must be boolean.");
@@ -676,11 +684,13 @@ const CLI_SANDBOX_OPTIONS = ["    security_opt:", "      - seccomp=./seccomp-cli
 
 export function renderWorkspaceCompose(config, { cliSandbox = false } = {}) {
   validateConfig(config);
+  const podman = containerEngine(config.engine) === "podman";
   const mounts = config.workspaces.flatMap((workspace) => [
     "      - type: bind",
     `        source: ${JSON.stringify(workspace.hostPath)}`,
     `        target: ${JSON.stringify(workspace.containerPath)}`,
-    `        read_only: ${workspace.readOnly}`
+    `        read_only: ${workspace.readOnly}`,
+    ...(podman ? ["        bind:", "          selinux: z", "          create_host_path: false"] : [])
   ]);
   const service = mounts.length > 0
     ? ["    volumes:", ...mounts]
@@ -695,12 +705,14 @@ export function renderWorkspaceCompose(config, { cliSandbox = false } = {}) {
     "      - type: bind",
     `        source: ${JSON.stringify(workspace.hostPath)}`,
     `        target: ${JSON.stringify(workspace.containerPath)}`,
-    `        read_only: ${workspace.readOnly}`
+    `        read_only: ${workspace.readOnly}`,
+    ...(podman ? ["        bind:", "          selinux: z", "          create_host_path: false"] : [])
   ];
   const userServices = users.flatMap((user) => {
     const slug = userSlug(user.id);
     return [
       `  spaceapp-cli-${slug}:`,
+      ...(podman ? ['    userns_mode: "keep-id:uid=10001,gid=10001"', '    user: "0:0"'] : []),
       // The owner's pinned CLI image (runtime.env sets the digest; 1.1.7 review: a moved tag cannot change a user's).
       "    image: ghcr.io/oll4com/spaceapp-cli:${SPACEAPP_IMAGE_TAG}${SPACEAPP_CLI_IMAGE_DIGEST:-}",
       "    restart: unless-stopped",
@@ -719,7 +731,7 @@ export function renderWorkspaceCompose(config, { cliSandbox = false } = {}) {
       `      - spaceapp-memory-${slug}:/var/lib/spaceapp/memory`,
       `      - spaceapp-cli-socket-${slug}:/run/spaceapp-cli`,
       `      - spaceapp-workspaces-${slug}:/workspaces`,
-      `      - ./secrets/users/${slug}/providers:/run/spaceapp-secrets/providers:ro`,
+      `      - ./secrets/users/${slug}/providers:/run/spaceapp-secrets/providers:${podman ? "ro,z" : "ro"}`,
       ...user.workspaces.flatMap(bind),
       // Its own network: internet only, never the owner's internal services (temporal, companions) or other users.
       "    networks:",
@@ -734,7 +746,7 @@ export function renderWorkspaceCompose(config, { cliSandbox = false } = {}) {
     "      SPACE_CLI_HOST_SOCKETS_FILE: /etc/spaceapp/cli-hosts.json",
     "    volumes:",
     ...(mounts.length > 0 ? mounts : []),
-    "      - ./cli-hosts.json:/etc/spaceapp/cli-hosts.json:ro",
+    `      - ./cli-hosts.json:/etc/spaceapp/cli-hosts.json:${podman ? "ro,z" : "ro"}`,
     ...users.map((user) => `      - spaceapp-cli-socket-${userSlug(user.id)}:/run/spaceapp-cli-users/${userSlug(user.id)}`),
     "  spaceapp-cli:",
     ...service,
@@ -757,6 +769,7 @@ export function renderCliHosts(config) {
 
 export function renderHostAccessCompose(config) {
   validateConfig(config);
+  if (containerEngine(config.engine) === "podman") return podmanComposeOverrides();
   if (config.accessMode === "isolated") {
     return "services: {}\n";
   }
@@ -909,7 +922,7 @@ export function composeCommand(action, root, options = {}) {
   if (!selected) {
     throw new Error(`Unsupported Compose action "${action}".`);
   }
-  return { command: "docker", args: [...base, ...selected] };
+  return engineCommand({ command: "docker", args: [...base, ...selected] }, options.engine);
 }
 
 export function composeProjectName(root) {
@@ -984,6 +997,7 @@ export async function prepareInstallation(root, {
   version,
   profile,
   accessMode,
+  engine,
   companionsEnabled
 }) {
   validateHome(root);
@@ -1007,8 +1021,16 @@ export async function prepareInstallation(root, {
       version,
       profile: resolvedProfile ?? "light",
       accessMode: resolveInstallAccessMode(accessMode),
+      engine,
       companionsEnabled
     });
+  }
+  if (engine !== undefined) {
+    const selected = containerEngine(engine);
+    if (containerEngine(config.engine) !== selected) {
+      throw new Error("Changing container engines would hide the existing volumes. Use a separate SPACEAPP_HOME.");
+    }
+    config = { ...config, engine: selected };
   }
   if (config.version !== version) {
     config = {
@@ -1091,7 +1113,12 @@ export async function commitInstallation(root, config, {
 } = {}) {
   validateHome(root);
   validateConfig(config);
-  const composeTemplate = await readFile(join(templateDir, "compose.yml"), "utf8");
+  let composeTemplate = await readFile(join(templateDir, "compose.yml"), "utf8");
+  if (containerEngine(config.engine) === "podman") {
+    // These relative binds are shared by several services on SELinux hosts.
+    composeTemplate = composeTemplate.replace(/^(\s+- \.\/[^\n]+?)(:ro)?$/gm,
+      (_line, source, readOnly) => `${source}:${readOnly ? "ro,z" : "z"}`);
+  }
   await mkdir(root, { recursive: true, mode: 0o700 });
   await atomicWrite(join(root, "compose.yml"), composeTemplate);
   await mkdir(projectRoot, { recursive: true, mode: 0o700 });
